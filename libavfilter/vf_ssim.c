@@ -44,6 +44,7 @@
 #include "filters.h"
 #include "framesync.h"
 #include "ssim.h"
+#include <math.h>
 
 typedef struct SSIMContext {
     const AVClass *class;
@@ -63,7 +64,14 @@ typedef struct SSIMContext {
     int **temp;
     int is_rgb;
     double **score;
+    uint64_t **i1[4], **i2[4], **s1[4], **s2[4], **i12[4];
+    int int_img;
+    int win_size;
+    int stride;
+    PoolMethod pool;
     int (*ssim_plane)(AVFilterContext *ctx, void *arg,
+                      int jobnr, int nb_jobs);
+    int (*ssim_plane_int)(AVFilterContext *ctx, void *arg,
                       int jobnr, int nb_jobs);
     SSIMDSPContext dsp;
 } SSIMContext;
@@ -74,6 +82,13 @@ typedef struct SSIMContext {
 static const AVOption ssim_options[] = {
     {"stats_file", "Set file where to store per-frame difference information", OFFSET(stats_file_str), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, FLAGS },
     {"f",          "Set file where to store per-frame difference information", OFFSET(stats_file_str), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, FLAGS },
+    { "int_img", "Compute SSIM using integral images", OFFSET(int_img), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
+    { "window", "Window size", OFFSET(win_size), AV_OPT_TYPE_INT, { .i64 = 8 }, 8, 16, FLAGS },
+    { "stride", "Stride length", OFFSET(stride), AV_OPT_TYPE_INT, { .i64 = 4 }, 4, 8, FLAGS },
+    { "pool", "Pooling method", OFFSET(pool), AV_OPT_TYPE_INT, {.i64 = AVG}, 0, 2, FLAGS, "pool" },
+    { "avg",   "Average pooling",     0, AV_OPT_TYPE_CONST, {.i64 = AVG}, 0, 0, FLAGS, "pool" },
+    { "mink3", "Minkowski norm 3",         0, AV_OPT_TYPE_CONST, {.i64 = MINK_3},   0, 0, FLAGS, "pool" },
+    { "mink4", "Minkowski norm 4",         0, AV_OPT_TYPE_CONST, {.i64 = MINK_4},   0, 0, FLAGS, "pool" },
     { NULL }
 };
 
@@ -175,6 +190,28 @@ static float ssim_end1x(int64_t s1, int64_t s2, int64_t ss, int64_t s12, int max
          / ((float)(fs1 * fs1 + fs2 * fs2 + ssim_c1) * (float)(vars + ssim_c2));
 }
 
+static float ssim_end1w(int s1, int s2, int ss, int s12, int win_size)
+{
+    double ws = (double)win_size * win_size;
+    double ssim_c1 = 0.01 * 0.01 * 255 * 255 * ws;
+    double ssim_c2 = 0.03 * 0.03 * 255 * 255 * ws * (ws - 1);
+
+    double fs1 = (double)s1;
+    double fs2 = (double)s2;
+    double fss = (double)ss;
+    double fs12 = (double)s12;
+
+    double vars = fss * ws - fs1 * fs1 - fs2 * fs2;
+    double covar = fs12 * ws - fs1 * fs2;
+
+    double num = (2 * fs1 * fs2 + ssim_c1) * (2 * covar + ssim_c2);
+    double den = (fs1 * fs1 + fs2 * fs2 + ssim_c1) * (vars + ssim_c2);
+
+    double ssim = num / den;
+
+    return ssim;
+}
+
 static float ssim_end1(int s1, int s2, int ss, int s12)
 {
     static const int ssim_c1 = (int)(.01*.01*255*255*64 + .5);
@@ -204,18 +241,53 @@ static float ssim_endn_16bit(const int64_t (*sum0)[4], const int64_t (*sum1)[4],
     return ssim;
 }
 
-static double ssim_endn_8bit(const int (*sum0)[4], const int (*sum1)[4], int width)
+static double ssim_endn_8bit(const int (*sum0)[4], const int (*sum1)[4], int width, int win_size, int stride, PoolMethod p)
 {
     double ssim = 0.0;
+    int exp = p == MINK_3 ? 3 : 4;
 
-    for (int i = 0; i < width; i++)
-        ssim += ssim_end1(sum0[i][0] + sum0[i + 1][0] + sum1[i][0] + sum1[i + 1][0],
+    if (p == AVG){
+        for (int i = 0; i <= (width-win_size)/stride; i++){
+            ssim += ssim_end1(sum0[i][0] + sum0[i + 1][0] + sum1[i][0] + sum1[i + 1][0],
                           sum0[i][1] + sum0[i + 1][1] + sum1[i][1] + sum1[i + 1][1],
                           sum0[i][2] + sum0[i + 1][2] + sum1[i][2] + sum1[i + 1][2],
                           sum0[i][3] + sum0[i + 1][3] + sum1[i][3] + sum1[i + 1][3]);
-    return ssim;
+        }
+        return ssim;
+    }
+    else{
+        float ssim_val;
+        for (int i = 0; i <= (width-win_size)/stride; i++){
+            ssim_val = pow((1 - ssim_end1(sum0[i][0] + sum0[i + 1][0] + sum1[i][0] + sum1[i + 1][0],
+                          sum0[i][1] + sum0[i + 1][1] + sum1[i][1] + sum1[i + 1][1],
+                          sum0[i][2] + sum0[i + 1][2] + sum1[i][2] + sum1[i + 1][2],
+                          sum0[i][3] + sum0[i + 1][3] + sum1[i][3] + sum1[i + 1][3])), exp);
+            ssim += ssim_val;
+        }
+        return ssim;
+    }
 }
 
+static double ssim_endline_int(const int (*sums)[4], int width, int win_size, int stride, PoolMethod p)
+{
+    double ssim = 0.0;
+    int i, exp = p == MINK_3 ? 3 : 4;
+
+    if (p == AVG){
+        for (i = 0; i <= (width-win_size)/stride; i++){
+            ssim += ssim_end1w(sums[i][0],sums[i][1],sums[i][2],sums[i][3],win_size);
+        }
+        return ssim;
+    }
+    else{
+        float ssim_val;
+        for (i = 0; i <= (width-win_size)/stride; i++){
+            ssim_val = pow((1 - ssim_end1w(sums[i][0],sums[i][1],sums[i][2],sums[i][3],win_size)), exp);
+            ssim += ssim_val;
+        }
+        return ssim;
+    }
+}
 #define SUM_LEN(w) (((w) >> 2) + 3)
 
 typedef struct ThreadData {
@@ -231,6 +303,54 @@ typedef struct ThreadData {
     int max;
     SSIMDSPContext *dsp;
 } ThreadData;
+
+static void ssim_4x4_line_int(uint64_t *i1, uint64_t *i2, uint64_t *s1, uint64_t *s2, uint64_t *i12, int win_size, int stride, int (*sums)[4], int width, int start)
+{
+    int k = win_size - 1;
+
+    for (int z = 0; z <= (width-win_size)/stride; z++){
+        int sum1 = 0, sum2 = 0, ss = 0, sum12 = 0;
+        int br = stride*z+k*width+k;
+        int tl = stride*z-width-1;
+        int bl = stride*z+k*width-1;
+        int tr = stride*z+k-width;
+
+        sum1 += i1[br];
+        sum2 += i2[br];
+        ss += s1[br];
+        ss += s2[br];
+        sum12 += i12[br];
+
+        if (!start && z != 0) {
+            sum1 += i1[tl];
+            sum2 += i2[tl];
+            ss += s1[tl];
+            ss += s2[tl];
+            sum12 += i12[tl];
+        }
+
+        if (z != 0) {
+            sum1 -= i1[bl];
+            sum2 -= i2[bl];
+            ss -= s1[bl];
+            ss -= s2[bl];
+            sum12 -= i12[bl];
+        }
+
+        if (!start){
+            sum1 -= i1[tr];
+            sum2 -= i2[tr];
+            ss -= s1[tr];
+            ss -= s2[tr];
+            sum12 -= i12[tr];
+        }
+
+        sums[z][0] = sum1;
+        sums[z][1] = sum2;
+        sums[z][2] = ss;
+        sums[z][3] = sum12;
+    }
+}
 
 static int ssim_plane_16bit(AVFilterContext *ctx, void *arg,
                             int jobnr, int nb_jobs)
@@ -275,9 +395,109 @@ static int ssim_plane_16bit(AVFilterContext *ctx, void *arg,
     return 0;
 }
 
+static void compute_int_images(SSIMContext *s, const uint8_t *master, const uint8_t *ref, int main_linesize, int ref_linesize, int slice_start, int slice_end, int c, int jobnr){
+    uint64_t vi1, vi2, vs1, vs2, vi12, *addi1, *addi2, *adds1, *adds2, *addi12;
+    int width = s->planewidth[c];
+
+    addi1 = s->i1[c][jobnr];
+    addi2 = s->i2[c][jobnr];
+    adds1 = s->s1[c][jobnr];
+    adds2 = s->s2[c][jobnr];
+    addi12 = s->i12[c][jobnr];
+
+    for (int h = 0; h < slice_end-slice_start; h++){
+        for (int w = 0; w < width; w++){
+            vi1 = master[w + (h+slice_start)*main_linesize];
+            vi2 = ref[w + (h+slice_start)*ref_linesize];
+            vs1 = vi1*vi1;
+            vs2 = vi2*vi2;
+            vi12 = vi1 * vi2;
+            if (h > 0){
+                vi1 += addi1[w + (h-1)*width];
+                vi2 += addi2[w + (h-1)*width];
+                vs1 += adds1[w + (h-1)*width];
+                vs2 += adds2[w + (h-1)*width];
+                vi12 += addi12[w + (h-1)*width];
+            }
+            if (w > 0){
+                vi1 += addi1[w-1 + h*width];
+                vi2 += addi2[w-1 + h*width];
+                vs1 += adds1[w-1 + h*width];
+                vs2 += adds2[w-1 + h*width];
+                vi12 += addi12[w-1 + h*width];
+            }
+            if (h > 0 && w > 0){
+                vi1 -= addi1[w-1 + (h-1)*width];
+                vi2 -= addi2[w-1 + (h-1)*width];
+                vs1 -= adds1[w-1 + (h-1)*width];
+                vs2 -= adds2[w-1 + (h-1)*width];
+                vi12 -= addi12[w-1 + (h-1)*width];
+            }
+            addi1[w + h*width] = vi1;
+            addi2[w + h*width] = vi2;
+            adds1[w + h*width] = vs1;
+            adds2[w + h*width] = vs2;
+            addi12[w + h*width] = vi12;
+        }
+    }
+
+    for (int h = 0; h < slice_end-slice_start; h++) {
+        addi1[h*width] = 0;
+        addi2[h*width] = 0;
+        adds1[h*width] = 0;
+        adds2[h*width] = 0;
+        addi12[h*width] = 0;
+    }
+
+    for (int w = 0; w < width; w++) {
+        addi1[w] = 0;
+        addi2[w] = 0;
+        adds1[w] = 0;
+        adds2[w] = 0;
+        addi12[w] = 0;
+    }
+}
+
+static int ssim_plane_int(AVFilterContext *ctx, void *arg,
+                      int jobnr, int nb_jobs)
+{
+    SSIMContext *s = ctx->priv;
+    ThreadData *td = arg;
+    double *score = td->score[jobnr];
+    void *temp = td->temp[jobnr];
+    int stride = s->stride, win_size = s->win_size;
+    uint64_t *i1, *i2, *s1, *s2, *i12;
+    int offset;
+
+    for (int c = 0; c < td->nb_components; c++) {
+        int width = td->planewidth[c];
+        int height = td->planeheight[c];
+        const int slice_start = ((height/stride) * jobnr) / nb_jobs;
+        const int slice_end = ((height/stride) * (jobnr+1)) / nb_jobs;
+        const int ystart = FFMAX(1, slice_start);
+        double ssim = 0.0;
+        int (*sums)[4] = temp;
+
+        compute_int_images(s, td->main_data[c], td->ref_data[c], td->main_linesize[c], td->ref_linesize[c], (ystart-1)*stride, slice_end*stride, c, jobnr);
+
+        i1 = s->i1[c][jobnr], i2 = s->i2[c][jobnr], s1 = s->s1[c][jobnr], s2 = s->s2[c][jobnr], i12 = s->i12[c][jobnr];
+        for (int y = ystart - 1; y < slice_end - win_size/stride + 1; y++) {
+                offset = (y - ystart + 1) * width*4;
+                ssim_4x4_line_int(i1+offset, i2+offset, s1+offset, s2+offset, i12+offset, s->win_size, s->stride, sums, width, y==(ystart-1));
+
+                ssim += ssim_endline_int((const int (*)[4])sums, width, s->win_size, s->stride, s->pool);
+        }
+
+        score[c] = ssim;
+    }
+
+    return 0;
+}
+
 static int ssim_plane(AVFilterContext *ctx, void *arg,
                       int jobnr, int nb_jobs)
 {
+    SSIMContext *s = ctx->priv;
     ThreadData *td = arg;
     double *score = td->score[jobnr];
     void *temp = td->temp[jobnr];
@@ -309,7 +529,11 @@ static int ssim_plane(AVFilterContext *ctx, void *arg,
                                    sum0, width);
             }
 
+#if ARCH_X86
             ssim += dsp->ssim_end_line((const int (*)[4])sum0, (const int (*)[4])sum1, width - 1);
+#else
+            ssim += ssim_endn_8bit((const int (*)[4])sum0, (const int (*)[4])sum1, (width<<2), s->win_size, s->stride, s->pool);
+#endif
         }
 
         score[c] = ssim;
@@ -364,13 +588,23 @@ static int do_ssim(FFFrameSync *fs)
                av_color_range_name(ref->color_range));
     }
 
-    ff_filter_execute(ctx, s->ssim_plane, &td, NULL,
+    if (s->int_img)
+        ff_filter_execute(ctx, s->ssim_plane_int, &td, NULL,
+                      FFMIN((s->planeheight[1] + 3) >> 2, s->nb_threads));
+    else
+        ff_filter_execute(ctx, s->ssim_plane, &td, NULL,
                       FFMIN((s->planeheight[1] + 3) >> 2, s->nb_threads));
 
     for (i = 0; i < s->nb_components; i++) {
         for (int j = 0; j < s->nb_threads; j++)
             c[i] += s->score[j][i];
-        c[i] = c[i] / (((s->planewidth[i] >> 2) - 1) * ((s->planeheight[i] >> 2) - 1));
+        c[i] = c[i] / ((s->planewidth[i]/s->stride - 1) * (s->planeheight[i]/s->stride - 1));
+        if (s->pool==MINK_3){
+            c[i] = 1 - pow(c[i], 1.0/3.0);
+        }
+        if (s->pool==MINK_4) {
+            c[i] = 1 - pow(c[i], 1.0/4.0);
+        }
     }
 
     for (i = 0; i < s->nb_components; i++) {
@@ -479,6 +713,7 @@ static int config_input_ref(AVFilterLink *inlink)
     s->max = (1 << desc->comp[0].depth) - 1;
 
     s->ssim_plane = desc->comp[0].depth > 8 ? ssim_plane_16bit : ssim_plane;
+    s->ssim_plane_int = ssim_plane_int;
     s->dsp.ssim_4x4_line = ssim_4x4xn_8bit;
     s->dsp.ssim_end_line = ssim_endn_8bit;
 #if ARCH_X86
@@ -493,6 +728,25 @@ static int config_input_ref(AVFilterLink *inlink)
         s->score[t] = av_calloc(s->nb_components, sizeof(*s->score[0]));
         if (!s->score[t])
             return AVERROR(ENOMEM);
+    }
+
+    if (s->int_img){
+        int nb_jobs = FFMIN((s->planeheight[1] + 3) >> 2, s->nb_threads);
+        int k = s->win_size;
+        for (int c = 0; c < s->nb_components; c++){
+            s->i1[c] = av_calloc(nb_jobs, sizeof(uint64_t*));
+            s->i2[c] = av_calloc(nb_jobs, sizeof(uint64_t*));
+            s->s1[c] = av_calloc(nb_jobs, sizeof(uint64_t*));
+            s->s2[c] = av_calloc(nb_jobs, sizeof(uint64_t*));
+            s->i12[c] = av_calloc(nb_jobs, sizeof(uint64_t*));
+            for (int i = 0; i < nb_jobs; i++){
+               s->i1[c][i] = av_calloc(((s->planewidth[c]) * (s->planeheight[c] + 2*k*nb_jobs) / nb_jobs), sizeof(uint64_t));
+               s->i2[c][i] = av_calloc(((s->planewidth[c]) * (s->planeheight[c] + 2*k*nb_jobs) / nb_jobs), sizeof(uint64_t));
+               s->s1[c][i] = av_calloc(((s->planewidth[c]) * (s->planeheight[c] + 2*k*nb_jobs) / nb_jobs), sizeof(uint64_t));
+               s->s2[c][i] = av_calloc(((s->planewidth[c]) * (s->planeheight[c] + 2*k*nb_jobs) / nb_jobs), sizeof(uint64_t));
+               s->i12[c][i] = av_calloc(((s->planewidth[c]) * (s->planeheight[c] + 2*k*nb_jobs) / nb_jobs), sizeof(uint64_t));
+            }
+        }
     }
 
     return 0;
@@ -550,6 +804,14 @@ static av_cold void uninit(AVFilterContext *ctx)
         }
         av_log(ctx, AV_LOG_INFO, "SSIM%s All:%f (%f)\n", buf,
                s->ssim_total / s->nb_frames, ssim_db(s->ssim_total, s->nb_frames));
+    }
+
+    if (s->int_img){
+        av_freep(&s->i1);
+        av_freep(&s->i2);
+        av_freep(&s->s1);
+        av_freep(&s->s2);
+        av_freep(&s->i12);
     }
 
     ff_framesync_uninit(&s->fs);

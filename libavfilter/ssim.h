@@ -24,6 +24,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+typedef enum {
+    AVG,
+    MINK_3,
+    MINK_4
+} PoolMethod;
+
 typedef struct SSIMDSPContext {
     void (*ssim_4x4_line)(const uint8_t *buf, ptrdiff_t buf_stride,
                           const uint8_t *ref, ptrdiff_t ref_stride,

@@ -22850,6 +22850,20 @@ The filter stores the calculated SSIM of each frame.
 The description of the accepted parameters follows.
 
 @table @option
+@item int_img
+If set to @code{1}, uses integral images to compute SSIM.
+
+@item window
+Sets the size of the widows over which SSIM is computed. Allowed values are @code{8} for an 8x8 window
+and @code{16} for a 16x16 window.
+
+@item stride
+Sets the stride between windows. Allowed values are @code{4} and @code{8}.
+
+@item pool
+Sets the pooling method. Allowed values are @code{avg}, the arithmetic average; @code{mink3} for Minkowski
+norm-3 and @code{mink4} for Minkwoski norm-4.
+
 @item stats_file, f
 If specified the filter will use the named file to save the SSIM of
 each individual frame. When filename equals "-" the data is sent to
